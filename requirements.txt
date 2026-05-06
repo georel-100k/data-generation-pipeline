@@ -1,0 +1,10 @@
+# Python dependencies for helper/download scripts.
+# Blender-specific modules such as bpy and mathutils are provided by Blender.
+huggingface_hub
+kagglehub
+numpy
+objaverse
+pandas
+pyarrow
+requests
+tqdm

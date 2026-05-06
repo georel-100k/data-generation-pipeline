@@ -216,3 +216,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Data-generation pipeline artifacts
+data/
+outputs/
+logs/
+logs*/
+*.blend
+*.exr
+*.obj
+*.glb
+*.gltf
+*.fbx
+*.tar
+*.tar.gz
