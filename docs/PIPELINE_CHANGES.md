@@ -20,7 +20,7 @@ was verified. Test numbers refer to `--test` runs (512×512, 16 samples) on 6 sc
    detached (background 0) at `NORMAL_SUPERSAMPLE` (4×) resolution, one ray per sub-pixel;
    `_supersampled_normals` averages each 4×4 block over the rays of its majority object
    and renormalises. Object boundaries stay crisp and every foreground normal is unit
-   length. *Why:* with one ray per pixel, dense meshes (mostly 3D scans, ~20% of objects)
+   length. *Why:* with one ray per pixel, dense meshes (mostly 3D scans, ≈20% of objects)
    gave per-pixel random normals. *Verified:* noisy objects' median neighbour-pixel angle
    21.1° → 13.6° (the rest is real surface roughness); normal and zdepth backgrounds agree
    on ≥ 99.955% of pixels.
@@ -69,16 +69,55 @@ was verified. Test numbers refer to `--test` runs (512×512, 16 samples) on 6 sc
    (apart from relative paths in the scene graph); a `--gpus cpu` run gives identical
    metadata.
 10. **Robustness for long runs.** The coordinator uses one thread per GPU slot (v6 created
-    one per scene); the per-process listing of the whole object pool was removed (~89% of
+    one per scene); the per-process listing of the whole object pool was removed (≈89% of
     log lines); the normal pass cleans up its temporary files in a `finally`; `[PASS1]` /
     `[PASS2]` log lines report seconds per view; unused functions with the old buggy logic
     were removed.
 11. **Settings.** BlenderKit is off (`USE_BLENDERKIT = False`), so materials are procedural
     and the random stream does not depend on a material cache.
 
+12. **Masks are 8-bit PNGs.** v6 wrote the combined mask as a float EXR and every per-object
+    mask as an uncompressed 32-bit RGBA EXR (≈8 MB each at 1024², ≈93 MB per view, about
+    two thirds of the dataset), built by a per-pixel Python loop. Both are now 8-bit
+    grayscale PNGs written from the object-index pass with numpy (`_write_masks`, encoded
+    directly so ids are stored exactly): `combined.png` holds the object id, `objNNN.png` is
+    255/0. *Verified:* identical, pixel for pixel, to the previous EXR masks (33 views, 210
+    per-object masks); masks shrink from ≈93 MB to ≈0.02 MB per view and the main render
+    from 2.0 s to 1.2 s per view.
+
+13. **Smaller `scene.blend`.** The `.blend` files were ≈80% of the output. Much of that was
+    data nothing used: the assets' own materials, replaced by procedural ones, and the
+    textures they packed on import (already-compressed PNGs, up to ≈90 MB per file). These
+    unused materials and images are now removed before saving, and the file is saved with
+    Blender's built-in compression (`BLEND_COMPRESS = True`); Blender opens it as usual.
+    6 test scenes: 2,952 → 880 MiB of `.blend` files (−70%), with depth, normals, masks,
+    metadata, scene graphs and COLMAP files pixel- and byte-identical.
+
+14. **Resumable runs.** v6 re-rendered every scene of the run on each invocation; resuming
+    meant editing `SCENE_INDEX_OFFSET` and `M`. The coordinator now skips complete scenes
+    (every arrangement has `scene.blend`, which is written last and saved atomically, and
+    no `ERROR.txt`); any other scene is cleared and rendered again. `--force` re-renders
+    complete scenes, and `--start-index` sets the first scene from the command line.
+    Tested by killing a 6-scene test run mid-render (2 scenes complete, 1 partial with a
+    leftover temporary folder) and re-running it: the 2 complete scenes were skipped, and
+    the result was identical to an uninterrupted run (920 depth, normal, mask, metadata,
+    scene-graph and COLMAP files pixel- and byte-identical, same file list). A scene with an
+    `ERROR.txt` was retried, and an all-complete run exits immediately.
+
+15. **Clean stop.** Ctrl-C, SIGTERM, SIGHUP or a closed output pipe now stop the coordinator
+    cleanly: it starts no new scenes, terminates its workers (killing any still alive after
+    20 s) and exits with code 130; re-running resumes. Before, if the output pipe broke (e.g.
+    Ctrl-C on `... | tee log` kills `tee` first), each scene thread failed on its next
+    print and released its GPU slot while its worker was still rendering, so the
+    coordinator started new scenes and then died, leaving orphaned workers. A GPU slot is now
+    released only after its worker has exited. Tested on a piped 6-scene run with Ctrl-C to
+    the whole process group, with only `tee` killed, and with SIGTERM to the coordinator
+    alone: in each case all Blender processes exited within 1 s and no new scenes started.
+
 ## Full-settings trial
 
-2 scenes at 1024×1024, 32 samples, 4× normal supersampling, 2 GPUs: 33 views in 78 s;
-per view 2.0 s main render + 2.3 s normal render; peak 3.7 GB RAM per Blender process and
-4.3 GB GPU memory; all views pass `scripts/validate_generated.py`. Output ~1.75 GB per scene,
-of which ~70% per-object masks and ~20% `scene.blend`.
+2 scenes at 1024×1024, 32 samples, 4× normal supersampling, 2 GPUs: 33 views in 68 s;
+per view 1.2 s main render + 2.6 s normal render; peak 3.7 GB RAM per Blender process and
+4.3 GB GPU memory; all views pass `scripts/validate_generated.py`. Images ≈0.1 GB per scene;
+`scene.blend` files ≈0.4–0.5 GB per scene on average uncompressed (most of the output),
+≈0.1–0.16 GB compressed (item 13).

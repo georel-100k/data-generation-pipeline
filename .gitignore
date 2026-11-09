@@ -231,3 +231,6 @@ logs*/
 *.fbx
 *.tar
 *.tar.gz
+
+# Local shell init files (machine-specific commands)
+.*shinit

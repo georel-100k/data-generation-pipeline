@@ -71,7 +71,7 @@ manifest.
      `object_name`;
    - adds the `license` column: ABO and GSO `by`; Objaverse from
      `manifest/source/objaverse_licenses.csv`, which is fetched from the `allenai/objaverse`
-     metadata if it is missing (or with `--refresh-licenses`; ~550 MB of metadata shards,
+     metadata if it is missing (or with `--refresh-licenses`; ≈550 MB of metadata shards,
      cached in `<data root>/cache/`).
 
 ```bash

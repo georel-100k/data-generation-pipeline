@@ -32,6 +32,7 @@ import ssl
 import argparse
 import sys
 import time
+import shutil
 
 # ── Config ────────────────────────────────────────────────────────────────────
 REPO_ROOT  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -43,7 +44,7 @@ N    = 27000   # objects to sample from the filtered pool
 M    = 10000    # number of scenes to generate
 Z    = 7.3     # mean objects per scene (Poisson, min 1)
 SEED = 2030
-SCENE_INDEX_OFFSET = 0  # first scene index to render, to resume a run (original run used 5401)
+SCENE_INDEX_OFFSET = 0  # first scene index of the run (--start-index overrides; original run used 5401)
 
 # Small test run, enabled with `-- --test` (overrides M, resolution, samples, output dir).
 # Seeds are unchanged, so test scene k has the same content as scene k of a full run.
@@ -91,6 +92,7 @@ RENDER_SAMPLES      = 32   # OIDN denoiser makes 16 samples look clean; raise if
 RENDER_SAMPLES_AUX  = 1    # normal pass: one ray per sub-pixel
 NORMAL_SUPERSAMPLE  = 4    # normal pass renders k x k sub-pixels per pixel, averaged per object
 RENDER_DENOISE      = True  # OIDN denoiser on RGB renders
+BLEND_COMPRESS      = True  # save scene.blend with Blender's file compression (opens normally)
 USE_CPU_WITH_GPU    = False  # True → also schedule CPU tiles alongside GPUs
 GPU_BACKEND         = "CUDA" # H200: CUDA is most reliable; "" = auto-detect
 
@@ -138,8 +140,8 @@ LIGHT_HEIGHT_MAX = 7.0
 random.seed(SEED)
 
 # ── CLI args ──────────────────────────────────────────────────────────────────
-# User-facing: --data-root, --manifest, --test, --num-scenes, --gpus. The rest are set
-# by the coordinator when spawning worker processes.
+# User-facing: --data-root, --manifest, --test, --num-scenes, --start-index, --force, --gpus.
+# The rest are set by the coordinator when spawning worker processes.
 _argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
 _ap   = argparse.ArgumentParser(add_help=False)
 _ap.add_argument("--data-root",      default=None,
@@ -150,6 +152,10 @@ _ap.add_argument("--test",           action="store_true",
                  help="Small test run using the TEST_* settings")
 _ap.add_argument("--num-scenes",     type=int, default=None,
                  help="Number of scenes to render (overrides M, also in --test)")
+_ap.add_argument("--start-index",    type=int, default=None,
+                 help="First scene index to render (overrides SCENE_INDEX_OFFSET; index i is scene_{i+1})")
+_ap.add_argument("--force",          action="store_true",
+                 help="Re-render scenes that are already complete (default: skip them)")
 _ap.add_argument("--gpus",           default=None,
                  help='GPU ids to use, e.g. "0,1", or "cpu"; default: all visible GPUs')
 _ap.add_argument("--worker",         action="store_true",
@@ -190,6 +196,11 @@ if _args.num_scenes is not None:
         raise ValueError("--num-scenes must be >= 1")
     M = _args.num_scenes
     _FORWARD_ARGS += ["--num-scenes", str(M)]
+if _args.start_index is not None:
+    if _args.start_index < 0:
+        raise ValueError("--start-index must be >= 0")
+    SCENE_INDEX_OFFSET = _args.start_index
+FORCE = _args.force
 
 IS_WORKER            = _args.worker
 WORKER_SCENE_INDICES = _args.scene_indices          # None in coordinator
@@ -1385,40 +1396,56 @@ def _make_world_normal_material():
     return mat
 
 
-def _split_object_masks(combined_exr: str, label: str,
-                         masks_dir: str, n_obj: int) -> None:
-    """
-    Load the combined IndexOB EXR (R channel = float object-id) and write
-    one binary EXR per object: 1.0 where that object, 0.0 everywhere else.
-    Output filenames: {label}_obj{id:03d}.exr
-    """
-    tmp = f"_combined_{label}"
-    if tmp in bpy.data.images:
-        bpy.data.images.remove(bpy.data.images[tmp])
-    img = bpy.data.images.load(combined_exr, check_existing=False)
-    img.name = tmp
-    img.colorspace_settings.name = "Non-Color"   # raw float, no gamma
+def _remove_unused_data() -> None:
+    """Before saving scene.blend, remove materials and images nothing uses: the assets' own
+    materials, replaced by procedural ones, and the textures they packed on import. They are
+    not rendered, and Blender would drop them on any later re-save anyway."""
+    for mat in list(bpy.data.materials):
+        if mat.users == 0:
+            bpy.data.materials.remove(mat)
+    for img in list(bpy.data.images):
+        if img.type == "IMAGE" and img.users == 0:
+            bpy.data.images.remove(img)
 
-    W, H   = img.size
-    pixels = list(img.pixels)                     # flat RGBA, W*H*4
 
+def _write_png_gray8(path: str, img) -> None:
+    """
+    Write a 2-D uint8 array (top row first) as an 8-bit grayscale PNG. Encoded
+    directly (zlib), so values are stored exactly, with no colour management.
+    """
+    import struct, zlib
+    import numpy as np
+    h, w = img.shape
+    rows = np.zeros((h, w + 1), dtype=np.uint8)       # filter byte 0 (none) per row
+    rows[:, 1:] = img
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n"
+                + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 0, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(rows.tobytes(), 6))
+                + chunk(b"IEND", b""))
+
+
+def _write_masks(ids_exr: str, label: str, masks_dir: str, n_obj: int) -> None:
+    """
+    Turn the object-index EXR from the main render into 8-bit PNG masks, then
+    delete the EXR:
+      {label}_combined.png      pixel value = object id (0 = room / background)
+      {label}_obj{id:03d}.png   255 where object id is visible, 0 elsewhere
+    """
+    import numpy as np
+    ids = np.rint(_load_exr_pixels(ids_exr)[::-1, :, 0]).astype(np.int64)   # top row first
+    if ids.min() < 0 or ids.max() > 255:
+        raise ValueError(f"object ids out of 8-bit range in {ids_exr}")
+    _write_png_gray8(os.path.join(masks_dir, f"{label}_combined.png"), ids.astype(np.uint8))
     for obj_id in range(1, n_obj + 1):
-        binary = []
-        for i in range(W * H):
-            bit = 1.0 if abs(pixels[i * 4] - obj_id) < 0.5 else 0.0
-            binary.extend([bit, bit, bit, 1.0])
-
-        name = f"_mask_{label}_obj{obj_id:03d}"
-        if name in bpy.data.images:
-            bpy.data.images.remove(bpy.data.images[name])
-        out = bpy.data.images.new(name, W, H, float_buffer=True, alpha=False)
-        out.pixels = binary
-        out.filepath_raw = os.path.join(masks_dir, f"{label}_obj{obj_id:03d}.exr")
-        out.file_format  = "OPEN_EXR"
-        out.save()
-        bpy.data.images.remove(out)
-
-    bpy.data.images.remove(img)
+        _write_png_gray8(os.path.join(masks_dir, f"{label}_obj{obj_id:03d}.png"),
+                         np.where(ids == obj_id, 255, 0).astype(np.uint8))
+    os.remove(ids_exr)
 
 
 # ── Combined-pass renderer (replaces the 4 separate render_* calls) ───────────
@@ -1564,11 +1591,12 @@ def render_all_passes(cameras: list, arr_dir: str, mesh_groups: list) -> None:
         out.file_slots[1].format.color_depth = "32"
         tree.links.new(rl.outputs["Depth"], out.inputs[1])
 
-        # Slot 2: IndexOB → EXR  (Value → Color implicit conversion via Math node)
+        # Slot 2: IndexOB → temporary EXR, turned into PNG masks by _write_masks
+        # (Value → Color implicit conversion via Math node)
         mn = tree.nodes.new("CompositorNodeMath")
         mn.operation = "ADD"; mn.inputs[1].default_value = 0.0
         tree.links.new(rl.outputs["IndexOB"], mn.inputs[0])
-        out.file_slots.new(f"masks/{label}_combined_")
+        out.file_slots.new(f"masks/{label}_ids_")
         out.file_slots[2].use_node_format  = False
         out.file_slots[2].format.file_format = "OPEN_EXR"
         out.file_slots[2].format.color_mode  = "RGB"
@@ -1607,14 +1635,11 @@ def render_all_passes(cameras: list, arr_dir: str, mesh_groups: list) -> None:
                                 f"rgb/{label}.png")
         _rename_output(arr_dir, f"depth/{label}_zdepth_0001.exr",
                                 f"depth/{label}_zdepth.exr")
-        _rename_output(arr_dir, f"masks/{label}_combined_0001.exr",
-                                f"masks/{label}_combined.exr")
         _rename_output(arr_dir, f"depth/{label}_euclidean_0001.exr",
                                 f"depth/{label}_euclidean.exr")
 
-        # Split combined IndexOB mask CPU-side into per-object binary EXRs
-        combined_exr = os.path.join(masks_dir, f"{label}_combined.exr")
-        _split_object_masks(combined_exr, label, masks_dir, n_obj)
+        # Object-index EXR → combined and per-object 8-bit PNG masks
+        _write_masks(os.path.join(masks_dir, f"{label}_ids_0001.exr"), label, masks_dir, n_obj)
         print(f"    [PASS1] {label}  RGB + zdepth + euclidean + masks ({time.time() - t0:.1f}s)")
 
     # Clean up main-pass settings
@@ -2220,8 +2245,27 @@ def _scene_seed(scene_idx: int) -> int:
 
 
 def _scene_indices() -> list:
-    """Scene indices to render in this run: M scenes starting at SCENE_INDEX_OFFSET."""
+    """Scene indices of this run: M scenes starting at SCENE_INDEX_OFFSET."""
     return list(range(SCENE_INDEX_OFFSET, SCENE_INDEX_OFFSET + M))
+
+
+def _scene_dir(scene_idx: int) -> str:
+    return os.path.join(OUTPUT_DIR, f"scene_{scene_idx+1:05d}")
+
+
+def _scene_complete(scene_idx: int) -> bool:
+    """
+    True if every arrangement has its scene.blend and no ERROR.txt. scene.blend is the
+    last file an arrangement writes, and Blender saves it to a temporary file that is
+    renamed when complete, so an interrupted save leaves no scene.blend.
+    """
+    scene_dir = _scene_dir(scene_idx)
+    for arr_idx in range(NUM_ARRANGEMENTS):
+        arr_dir = os.path.join(scene_dir, f"arr_{arr_idx+1:03d}")
+        if (not os.path.isfile(os.path.join(arr_dir, "scene.blend"))
+                or os.path.exists(os.path.join(arr_dir, "ERROR.txt"))):
+            return False
+    return True
 
 
 def _render_one_scene(scene_idx: int) -> int:
@@ -2235,10 +2279,15 @@ def _render_one_scene(scene_idx: int) -> int:
     # Re-seed per scene so a scene's content is the same whether it is rendered
     # by the coordinator, inline, or in a resumed run (SCENE_INDEX_OFFSET).
     random.seed(_scene_seed(scene_idx))
-    scene_label = f"scene_{scene_idx+1:03d}"
-    scene_dir   = os.path.join(OUTPUT_DIR, scene_label)
+    scene_label = f"scene_{scene_idx+1:05d}"
+    scene_dir   = _scene_dir(scene_idx)
 
     try:
+        if os.path.isdir(scene_dir):
+            # Output of an interrupted or failed attempt (or a --force re-render): start clean
+            # so no stale files or ERROR.txt markers remain. Same seed, same scene.
+            print(f"  [{scene_label}] removing previous output before rendering")
+            shutil.rmtree(scene_dir)
         os.makedirs(scene_dir, exist_ok=True)
 
         sampled   = random.sample(available, n_sample)
@@ -2357,7 +2406,8 @@ def _render_one_scene(scene_idx: int) -> int:
                                   f"{scene_label}_{arr_label}", arr_dir)
 
                 blend_path = os.path.join(arr_dir, "scene.blend")
-                bpy.ops.wm.save_as_mainfile(filepath=blend_path)
+                _remove_unused_data()
+                bpy.ops.wm.save_as_mainfile(filepath=blend_path, compress=BLEND_COMPRESS)
                 print(f"    [BLEND] saved {blend_path}")
                 print(f"    => arrangement {arr_idx+1} done  "
                       f"({n_cams} views × 6 outputs + scene.blend)")
@@ -2419,10 +2469,12 @@ def _run_coordinator() -> None:
     """
     Spawn one dedicated Blender process per scene.
     Concurrency is one process per GPU slot (_gpu_slots): a scene waits for a free
-    slot, runs pinned to that GPU, and releases it on completion (success or failure).
-    Errors in individual scenes are logged but never stop the pipeline.
+    slot, runs pinned to that GPU, and releases it when its process has exited.
+    Errors in individual scenes are logged but never stop the pipeline. Ctrl-C, SIGTERM,
+    SIGHUP or a closed output (e.g. a killed `| tee`) stop the run: no new scenes are
+    started and running workers are terminated. Re-running resumes.
     """
-    import subprocess, threading
+    import signal, subprocess, threading
     from queue import Queue
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -2439,24 +2491,72 @@ def _run_coordinator() -> None:
     n_slots = len(slots)
 
     # Each entry in the queue is one slot: a GPU id, "cpu", or None (no pinning).
-    # A scene must acquire a slot before launching; it releases on completion.
+    # A scene must acquire a slot before launching; it releases it after its process exits.
     gpu_queue: Queue = Queue()
     for g in slots:
         gpu_queue.put(g)
 
     results: dict = {}   # scene_idx → exit_code
-    lock = threading.Lock()
+    lock    = threading.RLock()   # re-entrant: signal handler may run while held
+    stop    = threading.Event()
+    procs   = set()      # running worker processes
 
-    print(f"\n{'='*60}")
-    print(f"[COORD] {M} scenes  |  {n_slots} concurrent slots  "
-          f"|  GPUs={slots}  |  MAX_OBJ={MAX_OBJECTS_PER_SCENE}")
-    print(f"{'='*60}")
-
-    def _run_scene(scene_idx: int) -> int:
-        """Acquire a GPU slot, run one Blender process, release slot."""
-        gpu_id = gpu_queue.get()   # blocks until a GPU is free
-        tag    = f"S{scene_idx+1:03d}|GPU{gpu_id if gpu_id is not None else 'all'}"
+    def _say(text: str) -> None:
+        """Print, tolerating a closed stdout; a closed stdout stops the run."""
         try:
+            sys.stdout.write(text if text.endswith("\n") else text + "\n")
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            _stop("output closed")
+
+    def _stop(reason: str) -> None:
+        """Stop launching scenes and terminate running workers (killed after 20 s)."""
+        with lock:
+            first = not stop.is_set()
+            stop.set()
+            running = [p for p in procs if p.poll() is None]
+        if first:
+            try:
+                sys.stderr.write(f"\n[COORD] stopping ({reason}): terminating "
+                                 f"{len(running)} worker(s); re-run to resume\n")
+            except (OSError, ValueError):
+                pass
+        for p in running:
+            p.terminate()
+        def _kill_leftovers():
+            for p in running:
+                if p.poll() is None:
+                    p.kill()
+        t = threading.Timer(20, _kill_leftovers)
+        t.daemon = True
+        t.start()
+
+    def _on_signal(signum, frame):
+        _stop(signal.Signals(signum).name)
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _on_signal)
+
+    indices = _scene_indices()
+    done    = {i for i in indices if _scene_complete(i)}
+    todo    = indices if FORCE else [i for i in indices if i not in done]
+    _say(f"\n{'='*60}")
+    _say(f"[COORD] scenes {indices[0]+1}-{indices[-1]+1}: {len(done)} already complete, "
+         f"{len(todo)} to render" + (" (--force: complete scenes re-rendered too)" if FORCE else ""))
+    _say(f"[COORD] {n_slots} concurrent slots  |  GPUs={slots}  |  MAX_OBJ={MAX_OBJECTS_PER_SCENE}")
+    _say(f"{'='*60}")
+    if not todo:
+        _say(f"[COORD] nothing to do. Output: {OUTPUT_DIR}")
+        return
+
+    def _run_scene(scene_idx: int):
+        """Acquire a GPU slot, run one Blender process, release slot. None if not started."""
+        gpu_id = gpu_queue.get()   # blocks until a GPU is free
+        tag    = f"S{scene_idx+1:05d}|GPU{gpu_id if gpu_id is not None else 'all'}"
+        proc   = None
+        try:
+            if stop.is_set():
+                return None
             seed_i = _scene_seed(scene_idx)
             cmd = [
                 blender, "--background", "--python", script,
@@ -2476,51 +2576,63 @@ def _run_coordinator() -> None:
                 env["HIP_VISIBLE_DEVICES"]  = str(gpu_id)
 
             with lock:
-                print(f"  [{tag}] starting  seed={seed_i}")
-
-            proc = subprocess.Popen(
-                cmd, env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True, bufsize=1,
-            )
-            for line in proc.stdout:
-                sys.stdout.write(f"  [{tag}] {line}")
-                sys.stdout.flush()
+                if stop.is_set():
+                    return None
+                proc = subprocess.Popen(
+                    cmd, env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True, bufsize=1,
+                )
+                procs.add(proc)
+            _say(f"  [{tag}] starting  seed={seed_i}")
+            for line in proc.stdout:          # read to the end, even if printing fails
+                if not stop.is_set():
+                    _say(f"  [{tag}] {line}")
             code = proc.wait()
-
-            with lock:
-                status = "OK" if code == 0 else f"FAILED (exit {code})"
-                print(f"  [{tag}] {status}")
+            if not stop.is_set():
+                _say(f"  [{tag}] " + ("OK" if code == 0 else f"FAILED (exit {code})"))
             return code
 
         except Exception as exc:
-            with lock:
-                print(f"  [{tag}] exception: {exc}")
+            _say(f"  [{tag}] exception: {exc}")
             return -1
 
         finally:
-            gpu_queue.put(gpu_id)   # always return the slot, even on error
+            if proc is not None:
+                if proc.poll() is None:       # never leave a worker running
+                    proc.kill()
+                proc.wait()
+                with lock:
+                    procs.discard(proc)
+            gpu_queue.put(gpu_id)   # return the slot only after the worker has exited
 
-    # Submit all M scenes; one thread per GPU slot (each thread runs one scene at a time)
+    # Submit the scenes; one thread per GPU slot (each thread runs one scene at a time)
     with ThreadPoolExecutor(max_workers=n_slots) as pool:
-        future_map = {pool.submit(_run_scene, i): i for i in _scene_indices()}
+        future_map = {pool.submit(_run_scene, i): i for i in todo}
         for future in as_completed(future_map):
             idx = future_map[future]
             try:
-                results[idx] = future.result()
+                code = future.result()
             except Exception as exc:
-                results[idx] = -1
-                print(f"  [S{idx+1:03d}] unhandled exception: {exc}")
+                code = -1
+                _say(f"  [S{idx+1:05d}] unhandled exception: {exc}")
+            if code is not None:
+                results[idx] = code
 
-    ok     = sum(1 for c in results.values() if c == 0)
-    failed = sorted(i + 1 for i, c in results.items() if c != 0)
-    print(f"\n{'='*60}")
-    print(f"[COORD] finished  —  {ok}/{M} OK  —  {len(failed)} failed")
+    ok      = sum(1 for c in results.values() if c == 0)
+    failed  = sorted(i + 1 for i, c in results.items() if c != 0)
+    stopped = stop.is_set()
+    _say(f"\n{'='*60}")
+    _say(f"[COORD] {'stopped' if stopped else 'finished'}  —  {ok}/{len(todo)} OK  —  "
+         f"{len(failed)} failed{' or interrupted' if stopped else ''}  —  "
+         f"{len(indices) - len(todo)} skipped (already complete)")
     if failed:
-        print(f"  Failed scene numbers: {failed}")
-    print(f"Output: {OUTPUT_DIR}")
-    print(f"{'='*60}\n")
+        _say(f"  {'Failed or interrupted' if stopped else 'Failed'} scene numbers: {failed}")
+    _say(f"Output: {OUTPUT_DIR}")
+    _say(f"{'='*60}\n")
+    if stopped:
+        sys.exit(130)
 
 
 def _run_worker(scene_indices: list) -> None:

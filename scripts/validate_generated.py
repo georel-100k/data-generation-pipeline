@@ -7,7 +7,8 @@ Per view checks:
   - worldspace (encoded 0.5*n+0.5) and camspace normals: same background, unit length,
     camspace == R_w2c_colmap @ decode(worldspace)
   - normal background agrees with zdepth background on >= --bg-agree-min of pixels
-  - combined object mask is non-empty; zdepth is finite
+  - masks (8-bit PNG): combined mask non-empty with ids 0..N (N objects), and each
+    per-object mask equal to (combined == id) * 255; zdepth is finite
 Per arrangement: every object's bounding box (metadata.json) stays inside the walls,
 |x|, |y| <= --floor-half (the walls' inner faces).
 
@@ -44,7 +45,7 @@ def read_exr(path: str, names: str) -> np.ndarray:
     return arrays[0] if len(arrays) == 1 else np.stack(arrays, axis=-1)
 
 
-def check_view(arr_dir: str, cam: str, meta: dict, bg_agree_min: float) -> list:
+def check_view(arr_dir: str, cam: str, meta: dict, n_obj: int, bg_agree_min: float) -> list:
     errors = []
     K = meta["intrinsics"]
     R = np.asarray(meta["extrinsics"]["R_w2c_colmap"], dtype=np.float64)
@@ -53,7 +54,7 @@ def check_view(arr_dir: str, cam: str, meta: dict, bg_agree_min: float) -> list:
     e   = read_exr(f"{arr_dir}/depth/{cam}_euclidean.exr", "R")
     ws  = read_exr(f"{arr_dir}/normals/{cam}_worldspace.exr", "RGB")
     cs  = read_exr(f"{arr_dir}/normals/{cam}_camspace.exr", "RGB")
-    mk  = read_exr(f"{arr_dir}/masks/{cam}_combined.exr", "R")
+    mk  = np.asarray(Image.open(f"{arr_dir}/masks/{cam}_combined.png"))
 
     H, W = z.shape
     if any(a.shape[:2] != (H, W) for a in (rgb, e, ws, cs, mk)):
@@ -87,8 +88,16 @@ def check_view(arr_dir: str, cam: str, meta: dict, bg_agree_min: float) -> list:
     agree = float((bg_cs == ~fg).mean())
     if agree < bg_agree_min:
         errors.append(f"normal/zdepth background agreement {agree:.5f} < {bg_agree_min}")
+    if mk.ndim != 2 or mk.dtype != np.uint8:
+        errors.append(f"combined mask is not 8-bit grayscale ({mk.dtype}, shape {mk.shape})")
     if not (mk > 0).any():
         errors.append("empty object mask")
+    if mk.max() > n_obj:
+        errors.append(f"mask id {int(mk.max())} > number of objects {n_obj}")
+    for obj_id in range(1, n_obj + 1):
+        om = np.asarray(Image.open(f"{arr_dir}/masks/{cam}_obj{obj_id:03d}.png"))
+        if om.shape != mk.shape or not np.array_equal(om, np.where(mk == obj_id, 255, 0)):
+            errors.append(f"obj{obj_id:03d} mask != (combined == {obj_id})")
     return errors
 
 
@@ -131,7 +140,8 @@ def main() -> None:
         cams = {c["label"]: c for c in meta["cameras"]}
         for cam in sorted(cams):
             try:
-                errors = check_view(arr_dir, cam, cams[cam], args.bg_agree_min)
+                errors = check_view(arr_dir, cam, cams[cam], len(meta.get("objects", [])),
+                                    args.bg_agree_min)
             except Exception as exc:
                 errors = [repr(exc)]
             report.append({"view": os.path.relpath(os.path.join(arr_dir, cam), args.root), "errors": errors})

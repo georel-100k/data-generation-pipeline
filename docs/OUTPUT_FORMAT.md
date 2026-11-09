@@ -6,15 +6,15 @@ What `pipeline/blender_pipeline.py` writes, and the conventions every file follo
 
 ```text
 <data root>/<output>/                      generated/ (full run) or generated_test/ (--test)
-└── scene_001/                             one set of objects (sizes and materials fixed)
+└── scene_00001/                             one set of objects (sizes and materials fixed)
     ├── arr_001/                           one layout of those objects (3 per scene)
     │   ├── rgb/<view>.png
     │   ├── depth/<view>_zdepth.exr
     │   ├── depth/<view>_euclidean.exr
     │   ├── normals/<view>_camspace.exr
     │   ├── normals/<view>_worldspace.exr
-    │   ├── masks/<view>_combined.exr
-    │   ├── masks/<view>_obj001.exr …       one per object
+    │   ├── masks/<view>_combined.png
+    │   ├── masks/<view>_obj001.png …       one per object
     │   ├── colmap/cameras.txt
     │   ├── colmap/images.txt
     │   ├── colmap/points3D.txt             empty (poses only)
@@ -49,7 +49,8 @@ scene rendering), then shrunk if needed to fit the room.
 
 ## Per-view files
 
-All EXRs are 32-bit float with channels R, G, B (OpenCV reads them as BGR).
+All EXRs are 32-bit float with channels R, G, B (OpenCV reads them as BGR). Masks are 8-bit
+grayscale PNGs (lossless).
 
 | File | Content | Background (no geometry) |
 |---|---|---|
@@ -58,8 +59,8 @@ All EXRs are 32-bit float with channels R, G, B (OpenCV reads them as BGR).
 | `depth/<view>_euclidean.exr` | Distance from the camera centre along each pixel's ray, metres: `zdepth · ‖((u+0.5−cx)/fx, (v+0.5−cy)/fy, 1)‖`. Pixel-aligned with zdepth. R = G = B. | `≥ 1e10` |
 | `normals/<view>_camspace.exr` | Unit surface normal in the **camera frame** (OpenCV), R = x, G = y, B = z, in [−1, 1]. Surfaces facing the camera have z < 0. | `(0, 0, 0)` |
 | `normals/<view>_worldspace.exr` | Unit surface normal in the **world frame**, encoded `v = 0.5·n + 0.5` (decode `n = 2v − 1`). | `(0, 0, 0)` (decodes to a non-unit vector; test for all-zero) |
-| `masks/<view>_combined.exr` | Object ID per pixel: `0` = room or background, `k` = object `k`. R = G = B. | `0` |
-| `masks/<view>_objNNN.exr` | Binary mask of object `NNN`: 1 where visible, 0 elsewhere (threshold at 0.5). | `0` |
+| `masks/<view>_combined.png` | 8-bit grayscale; pixel value = object ID: `0` = room or background, `k` = object `k` (at most 12 per scene). | `0` |
+| `masks/<view>_objNNN.png` | 8-bit grayscale binary mask of object `NNN`: 255 where visible, 0 elsewhere (equal to `combined == NNN`). | `0` |
 
 Normals come from a supersampled pass: 4×4 rays per pixel (`NORMAL_SUPERSAMPLE`), each
 pixel averaging only the rays that hit its majority object, then renormalised. Fine
@@ -106,7 +107,7 @@ the mesh for rotated parts.
 ### `scene_graph.json`
 
 ```text
-scene_id                 e.g. "scene_001_arr_001"
+scene_id                 e.g. "scene_00001_arr_001"
 num_objects
 nodes[]                  one per object
   id                     same id as metadata.json / masks
@@ -130,9 +131,11 @@ Asset identity (`filepath`, `class`, `object_name`) is only in the scene graph;
 
 The Blender scene at the end of the arrangement: room, objects with materials (most
 textures packed), cameras and lights. Useful for re-rendering; it embeds the source meshes, so it is
-subject to the assets' licenses.
+subject to the assets' licenses. Saved with Blender's file compression (`BLEND_COMPRESS`), which
+Blender reads transparently; unused materials and images are removed before saving.
 
 ## Sizes
 
-Per scene with the test settings (512×512): ~0.75 GB; at 1024×1024: ~1.75 GB. Almost all of
-it is `scene.blend` and the per-object masks; RGB, depth and normals are a few percent.
+At 1024×1024 with ≈12 views per scene: ≈0.1 GB per scene of images (per view ≈5.8 MB depth,
+≈1.4 MB normals, ≈1.1 MB RGB, ≈0.02 MB masks), plus `scene.blend` files, which depend on the
+objects and average ≈0.1–0.16 GB per scene compressed (≈0.4–0.5 GB uncompressed).
