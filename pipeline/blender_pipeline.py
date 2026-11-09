@@ -1,3 +1,23 @@
+"""
+GeoRel scene generator (Blender 4.5, Cycles).
+
+Places objects from the asset manifest in a simple room, renders several camera
+views per arrangement and writes RGB, depth, normals, masks, COLMAP poses,
+metadata.json, scene_graph.json and scene.blend per arrangement.
+
+Run from the repository root:
+
+    blender --background --python pipeline/blender_pipeline.py              # full run
+    blender --background --python pipeline/blender_pipeline.py -- --test    # small test run
+    blender --background --python pipeline/blender_pipeline.py -- --num-scenes 2 \
+        --data-root ../dataset/georel-cvpr
+
+Settings are the constants below. The asset manifest is read from manifest/ in this
+repository; asset paths in it are relative to the data root (--data-root, default
+<repo>/__artifacts), which also receives the output. Relative paths given on the
+command line are resolved from the repository root.
+"""
+
 import bpy
 import os
 import csv
@@ -11,40 +31,26 @@ import urllib.parse
 import ssl
 import argparse
 import sys
-
-# ----------------------------
-# GET ARGUMENTS AFTER '--'
-# ----------------------------
-#argv = sys.argv
-
-#if "--" in argv:
-#    argv = argv[argv.index("--") + 1:]
-#else:
-#    argv = []
-
-## ----------------------------
-## PARSE
-## ----------------------------
-#parser = argparse.ArgumentParser()
-
-#parser.add_argument("--fstart", type=str, required=True)
-
-#args = parser.parse_args(argv)
-# ── Config ────────────────────────────────────────────────────────────────────
-# CSV_PATH   = "/Users/namanlal/Desktop/test_data/gemma_classified_expanded2.csv"
-# OUTPUT_DIR = f"/Users/namanlal/Desktop/test_data/{args.fstart}"
+import time
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CSV_PATH   = "/workspace/data/gemma_classified_expanded.csv"
-OUTPUT_DIR = f"/workspace/data/final_output_scenes2/"
-# ── Config ────────────────────────────────────────────────────────────────────
-# CSV_PATH   = "/Users/namanlal/Desktop/test_data/gemma_classified_expanded.csv"
-# OUTPUT_DIR = "/Users/namanlal/Desktop/test_data/scenes"
+REPO_ROOT  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_ROOT  = os.path.join(REPO_ROOT, "__artifacts")        # --data-root overrides
+CSV_PATH   = os.path.join(REPO_ROOT, "manifest", "asset_manifest.csv")   # --manifest overrides
+OUTPUT_DIR = os.path.join(DATA_ROOT, "generated")
 
 N    = 27000   # objects to sample from the filtered pool
-M    = 40000    # number of scenes to generate
-Z    = 8.3     # mean objects per scene (Poisson, min 1)
-SEED = 2021
+M    = 10000    # number of scenes to generate
+Z    = 7.3     # mean objects per scene (Poisson, min 1)
+SEED = 2030
+SCENE_INDEX_OFFSET = 0  # first scene index to render, to resume a run (original run used 5401)
+
+# Small test run, enabled with `-- --test` (overrides M, resolution, samples, output dir).
+# Seeds are unchanged, so test scene k has the same content as scene k of a full run.
+TEST_NUM_SCENES     = 4
+TEST_RENDER_RES     = (512, 512)
+TEST_RENDER_SAMPLES = 16
+TEST_OUTPUT_DIR     = os.path.join(DATA_ROOT, "generated_test")
 
 # Objects are normalised so their largest bbox axis lands in this range
 TARGET_SIZE_MIN = 1.8
@@ -52,7 +58,7 @@ TARGET_SIZE_MAX = 3.5
 
 # Room dimensions
 FLOOR_HALF     = 2.2    # half-extent; floor is (2*FLOOR_HALF) × (2*FLOOR_HALF)
-WALL_HEIGHT    = 2.4
+WALL_HEIGHT    = 1.9
 WALL_THICKNESS = 0.12
 
 # Placement: distance from scene origin to object XY-centre
@@ -62,6 +68,9 @@ COLLISION_MARGIN = 0.9   # minimum clear gap between object footprint circles
 
 PLACEMENT_RETRIES    = 20
 MIN_GAP              = 0.15  # minimum 3D AABB gap required between objects (Blender units)
+WALL_CLEARANCE       = 0.05  # minimum gap between any object and the walls' inner faces
+REARRANGE_ATTEMPTS   = 50    # restarts when building a later arrangement (move-only)
+REARRANGE_TRIES      = 40    # random yaw/position tries per object per restart
 MAX_OBJECTS_PER_SCENE = 12   # hard cap on objects loaded per scene (overrides Poisson)
 
 # ── Camera config ─────────────────────────────────────────────────────────────
@@ -79,7 +88,8 @@ RENDER_RES_X        = 1024
 RENDER_RES_Y        = 1024
 RENDER_ENGINE       = "CYCLES"
 RENDER_SAMPLES      = 32   # OIDN denoiser makes 16 samples look clean; raise if quality needed
-RENDER_SAMPLES_AUX  = 2    # depth / normals / mask passes — pure emission, minimal samples needed
+RENDER_SAMPLES_AUX  = 1    # normal pass: one ray per sub-pixel
+NORMAL_SUPERSAMPLE  = 4    # normal pass renders k x k sub-pixels per pixel, averaged per object
 RENDER_DENOISE      = True  # OIDN denoiser on RGB renders
 USE_CPU_WITH_GPU    = False  # True → also schedule CPU tiles alongside GPUs
 GPU_BACKEND         = "CUDA" # H200: CUDA is most reliable; "" = auto-detect
@@ -102,7 +112,7 @@ BLENDER_UNIT_TO_M = 1.0   # 1 Blender unit == 1 metre
 # Leave empty to read the key already saved in Blender addon preferences.
 BLENDERKIT_API_KEY = ""
 BLENDERKIT_CACHE   = os.path.join(OUTPUT_DIR, "_bk_cache")
-USE_BLENDERKIT     = True   # False → always use procedural materials
+USE_BLENDERKIT     = False  # False → always use procedural materials
 
 # Keywords searched in rotation; picked randomly per object
 _BK_KEYWORDS = [
@@ -120,60 +130,104 @@ LIGHT_HEIGHT_MIN = 3.0
 LIGHT_HEIGHT_MAX = 7.0
 
 # ── Parallelism ───────────────────────────────────────────────────────────────
-# Each worker is a separate Blender process pinned to one GPU via
-# CUDA_VISIBLE_DEVICES so they never contend for the same device.
-N_WORKERS = 8              # one worker per GPU
-GPU_IDS   = [0]  # physical CUDA device IDs — worker i gets GPU_IDS[i%len]
-                           # set [] to let every worker use all GPUs (single-GPU mode)
+# The coordinator runs one Blender worker process per scene, at most one at a time
+# per GPU, pinned with CUDA_VISIBLE_DEVICES. GPUs come from --gpus ("0,1" or "cpu");
+# by default all visible GPUs are used (CUDA_VISIBLE_DEVICES if set, else nvidia-smi).
 # ─────────────────────────────────────────────────────────────────────────────
 
 random.seed(SEED)
 
-# ── CLI args (set by coordinator when spawning worker processes) ───────────────
+# ── CLI args ──────────────────────────────────────────────────────────────────
+# User-facing: --data-root, --manifest, --test, --num-scenes, --gpus. The rest are set
+# by the coordinator when spawning worker processes.
 _argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
 _ap   = argparse.ArgumentParser(add_help=False)
+_ap.add_argument("--data-root",      default=None,
+                 help="Data root holding assets/ and receiving output (default: <repo>/__artifacts)")
+_ap.add_argument("--manifest",       default=None,
+                 help="Asset manifest CSV (default: <repo>/manifest/asset_manifest.csv)")
+_ap.add_argument("--test",           action="store_true",
+                 help="Small test run using the TEST_* settings")
+_ap.add_argument("--num-scenes",     type=int, default=None,
+                 help="Number of scenes to render (overrides M, also in --test)")
+_ap.add_argument("--gpus",           default=None,
+                 help='GPU ids to use, e.g. "0,1", or "cpu"; default: all visible GPUs')
 _ap.add_argument("--worker",         action="store_true",
                  help="Run as a worker (renders assigned scenes only)")
 _ap.add_argument("--scene-indices",  nargs="+", type=int, default=None,
                  help="Scene indices this worker should render")
 _ap.add_argument("--worker-seed",    type=int, default=None,
                  help="RNG seed for this worker")
-_ap.add_argument("--worker-gpu-id",  type=int, default=None,
-                 help="CUDA device index to pin to (optional)")
+_ap.add_argument("--worker-gpu-id",  default=None,
+                 help="GPU this worker is pinned to (log label only)")
 _args, _ = _ap.parse_known_args(_argv)
+
+def _repo_path(path: str) -> str:
+    """Command-line paths: absolute as given, relative ones from the repository root."""
+    return os.path.abspath(os.path.join(REPO_ROOT, os.path.expanduser(path)))
+
+
+# Settings overrides; also forwarded to worker processes so they match the coordinator
+_FORWARD_ARGS = []
+if _args.data_root is not None:
+    DATA_ROOT        = _repo_path(_args.data_root)
+    OUTPUT_DIR       = os.path.join(DATA_ROOT, "generated")
+    TEST_OUTPUT_DIR  = os.path.join(DATA_ROOT, "generated_test")
+    BLENDERKIT_CACHE = os.path.join(OUTPUT_DIR, "_bk_cache")
+    _FORWARD_ARGS += ["--data-root", DATA_ROOT]
+if _args.manifest is not None:
+    CSV_PATH = _repo_path(_args.manifest)
+    _FORWARD_ARGS += ["--manifest", CSV_PATH]
+if _args.test:
+    M = TEST_NUM_SCENES
+    RENDER_RES_X, RENDER_RES_Y = TEST_RENDER_RES
+    RENDER_SAMPLES   = TEST_RENDER_SAMPLES
+    OUTPUT_DIR       = TEST_OUTPUT_DIR
+    BLENDERKIT_CACHE = os.path.join(OUTPUT_DIR, "_bk_cache")
+    _FORWARD_ARGS.append("--test")
+if _args.num_scenes is not None:
+    if _args.num_scenes < 1:
+        raise ValueError("--num-scenes must be >= 1")
+    M = _args.num_scenes
+    _FORWARD_ARGS += ["--num-scenes", str(M)]
 
 IS_WORKER            = _args.worker
 WORKER_SCENE_INDICES = _args.scene_indices          # None in coordinator
 WORKER_GPU_ID        = _args.worker_gpu_id          # None = no pinning
 if _args.worker_seed is not None:
     random.seed(_args.worker_seed)                  # each worker gets its own RNG
+if not IS_WORKER:
+    print(f"[CONFIG] {'TEST run' if _args.test else 'full run'}: {M} scenes from index "
+          f"{SCENE_INDEX_OFFSET}, {RENDER_RES_X}x{RENDER_RES_Y}, {RENDER_SAMPLES} samples, "
+          f"manifest {CSV_PATH}, output {OUTPUT_DIR}")
 
 
 # ── Load & filter CSV ─────────────────────────────────────────────────────────
+def _data_path(path: str) -> str:
+    """Manifest paths are relative to DATA_ROOT; absolute paths are used as given."""
+    return path if not path or os.path.isabs(path) else os.path.join(DATA_ROOT, path)
+
+
 all_rows = []
 with open(CSV_PATH, newline="", encoding="utf-8") as f:
     reader = csv.DictReader(f)
     for row in reader:
+        row["_abs_filepath"] = _data_path(row.get("filepath", ""))
+        row["_abs_texture"]  = _data_path(row.get("texture_filepath", "").strip())
         all_rows.append(row)
 
 VALID_LOCATIONS = {"indoor", "both"}
 
 available = [
     row for row in all_rows
-    if row.get("filepath")
-    and os.path.isfile(row["filepath"])
+    if row["_abs_filepath"]
+    and os.path.isfile(row["_abs_filepath"])
     and row.get("gemma_location_type", "").strip().lower() in VALID_LOCATIONS
 ]
 
 print(f"\n{'='*60}")
 print(f"Total rows in CSV          : {len(all_rows)}")
 print(f"After indoor/both filter   : {len(available)}")
-print(f"{'='*60}")
-print("\nObjects available to load:")
-for i, row in enumerate(available):
-    name = row.get("object_name") or row.get("filename") or "unknown"
-    loc  = row.get("gemma_location_type", "?")
-    print(f"  [{i:>4}] [{loc:7s}] {name}  ->  {row['filepath']}")
 print(f"{'='*60}\n")
 
 if not available:
@@ -866,16 +920,69 @@ def random_rotate(roots: list, meshes: list) -> None:
 
 
 def _scale_down_group(roots: list, meshes: list, factor: float = 0.85) -> None:
-    """Scale a group down by factor, bake scale, then re-snap to floor."""
+    """
+    Scale a group down by factor about its footprint centre, bake scale, then
+    re-snap to floor. (Scaling about the root origin alone would also slide the
+    mesh, since imported origins are often far from the geometry.)
+    """
     if not roots:
         return
     bpy.context.view_layer.update()
+    cx, cy = group_center_xy(meshes)
     for obj in roots:
         obj.scale = obj.scale * factor
     _select_roots(roots)
     bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
     bpy.context.view_layer.update()
+    move_group_xy(roots, meshes, cx, cy)
     place_on_floor(roots, meshes, floor_z=0.0)
+
+
+def keep_inside_room(roots: list, meshes: list) -> bool:
+    """
+    Make the group's footprint fit inside the walls (|x|, |y| <= FLOOR_HALF -
+    WALL_CLEARANCE): shrink it if it is wider than the room, then shift it inward
+    by however far it crosses a wall. Returns True if the group was changed.
+    """
+    limit = FLOOR_HALF - WALL_CLEARANCE
+    changed = False
+    mn, mx = group_world_bbox(meshes)
+    span = max(mx[0] - mn[0], mx[1] - mn[1])
+    if span > 2 * limit:
+        _scale_down_group(roots, meshes, 0.98 * 2 * limit / span)
+        mn, mx = group_world_bbox(meshes)
+        changed = True
+    shift = []
+    for axis in (0, 1):
+        if mn[axis] < -limit:
+            shift.append(-limit - mn[axis])
+        elif mx[axis] > limit:
+            shift.append(limit - mx[axis])
+        else:
+            shift.append(0.0)
+    if shift[0] or shift[1]:
+        cx, cy = group_center_xy(meshes)
+        move_group_xy(roots, meshes, cx + shift[0], cy + shift[1])
+        changed = True
+    return changed
+
+
+def contain_and_resolve(roots_list: list, mesh_groups: list,
+                        placed_circles: list, max_rounds: int = 4) -> list:
+    """
+    Final placement pass: pull every group inside the walls, re-run overlap
+    resolution if anything moved, and repeat; the wall constraint is applied last
+    so no object ever crosses a wall. Returns synced placed_circles.
+    """
+    for _round in range(max_rounds):
+        moved = [keep_inside_room(r, m) for r, m in zip(roots_list, mesh_groups)]
+        if not any(moved):
+            break
+        print(f"    [WALLS] kept {sum(moved)} object(s) inside the room")
+        placed_circles = resolve_overlaps(roots_list, mesh_groups, placed_circles)
+    for roots, meshes in zip(roots_list, mesh_groups):
+        keep_inside_room(roots, meshes)
+    return [(*group_center_xy(m), group_footprint_radius(m)) for m in mesh_groups]
 
 
 def resolve_overlaps(roots_list: list, mesh_groups: list,
@@ -982,6 +1089,15 @@ def find_free_position(radius: float, placed: list) -> tuple | None:
         if attempt % 10 == 9:
             effective = min(effective + 0.4, FLOOR_HALF - radius - 0.05)
     return None
+
+
+def fallback_position(radius: float, frac: float) -> tuple:
+    """
+    Random spot used when find_free_position fails: within +-frac*FLOOR_HALF, but
+    never so far out that the footprint circle would cross a wall.
+    """
+    half = min(FLOOR_HALF * frac, max(FLOOR_HALF - radius - WALL_CLEARANCE, 0.0))
+    return random.uniform(-half, half), random.uniform(-half, half)
 
 
 # ── Import ────────────────────────────────────────────────────────────────────
@@ -1167,94 +1283,9 @@ def create_cameras(target: mathutils.Vector, n_cams: int) -> list:
 
 
 # ── Cycles GPU setup ─────────────────────────────────────────────────────────
-def configure_cycles_gpu() -> None:
-    """
-    Detect and activate every available GPU for Cycles.
-
-    Backend priority: OptiX (NVIDIA RT cores) → CUDA → HIP (AMD) →
-                      Metal (Apple) → OneAPI (Intel Arc) → CPU fallback.
-
-    All GPU devices found under the winning backend are enabled.
-    CPU tiles are added when USE_CPU_WITH_GPU is True.
-    """
-    if RENDER_ENGINE != "CYCLES":
-        return
-
-    scene = bpy.context.scene
-    scene.cycles.device = "GPU"
-
-    cycles_prefs = bpy.context.preferences.addons.get("cycles")
-    if cycles_prefs is None:
-        print("[GPU] Cycles addon not found – rendering on CPU")
-        scene.cycles.device = "CPU"
-        return
-
-    prefs = cycles_prefs.preferences
-
-    order = [GPU_BACKEND] if GPU_BACKEND else ["OPTIX", "CUDA", "HIP", "METAL", "ONEAPI"]
-    for backend in order:
-        try:
-            prefs.compute_device_type = backend
-            prefs.get_devices()
-            gpus = [d for d in prefs.devices if d.type != "CPU"]
-            if not gpus:
-                continue
-            for d in prefs.devices:
-                d.use = (d.type != "CPU") or USE_CPU_WITH_GPU
-            active = [d.name for d in prefs.devices if d.use]
-            print(f"[GPU] backend={backend}  devices={active}")
-            return
-        except Exception as exc:
-            print(f"[GPU] {backend} failed: {exc}")
-            continue
-
-    # No GPU found
-    scene.cycles.device = "CPU"
-    print("[GPU] No GPU found – falling back to CPU rendering")
 
 
 # ── Render helpers ────────────────────────────────────────────────────────────
-def _eevee_engine() -> str:
-    """Return the correct EEVEE engine identifier for this Blender version."""
-    major, minor = bpy.app.version[:2]
-    return "BLENDER_EEVEE_NEXT" if (major, minor) >= (4, 2) else "BLENDER_EEVEE"
-
-
-# Cache the EGL check so we only probe the filesystem once per process.
-_egl_available: bool | None = None
-
-def _aux_engine() -> str:
-    """
-    Return the fastest engine suitable for aux passes (normals, euclidean depth).
-
-    On workstations with full OpenGL drivers this is EEVEE (~instant renders).
-    On headless servers libEGL.so is often missing, causing Blender to crash when
-    EEVEE initialises.  In that case we transparently fall back to Cycles with
-    minimal samples — still very fast thanks to use_persistent_data.
-
-    Detection order:
-      1. DISPLAY env var set        → assume desktop, use EEVEE
-      2. libEGL found in ld cache   → EGL present, use EEVEE
-      3. libEGL found in /usr/lib*  → EGL present, use EEVEE
-      4. Nothing found              → headless server, use Cycles
-    """
-    global _egl_available
-    if _egl_available is None:
-        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
-            _egl_available = True
-        else:
-            import ctypes.util, glob
-            found_via_ldconfig = ctypes.util.find_library("EGL") is not None
-            found_on_disk = bool(
-                glob.glob("/usr/lib/x86_64-linux-gnu/libEGL.so*") +
-                glob.glob("/usr/lib64/libEGL.so*") +
-                glob.glob("/usr/lib/aarch64-linux-gnu/libEGL.so*") +
-                glob.glob("/usr/lib/libEGL.so*")
-            )
-            _egl_available = found_via_ldconfig or found_on_disk
-        print(f"[AUX] EGL available={_egl_available}  "
-              f"→ aux engine={'EEVEE' if _egl_available else 'CYCLES (headless fallback)'}")
-    return _eevee_engine() if _egl_available else RENDER_ENGINE
 
 
 def _setup_render(engine=RENDER_ENGINE, fmt="PNG", color_mode="RGBA", color_depth="8",
@@ -1308,17 +1339,6 @@ def _setup_render(engine=RENDER_ENGINE, fmt="PNG", color_mode="RGBA", color_dept
     scene.view_layers[0].material_override = None
 
 
-def render_all(cameras: list, rgb_dir: str) -> None:
-    os.makedirs(rgb_dir, exist_ok=True)
-    _setup_render(fmt="PNG", color_mode="RGBA")
-    scene = bpy.context.scene
-    for cam, label in cameras:
-        scene.camera          = cam
-        scene.render.filepath = os.path.join(rgb_dir, f"{label}.png")
-        bpy.ops.render.render(write_still=True)
-        print(f"    [RENDER] rgb/{label}.png")
-
-
 # ── Object-ID assignment (for instance masks) ─────────────────────────────────
 def assign_object_ids(mesh_groups: list) -> None:
     """Set obj.pass_index = 1-based group index on every mesh in each group."""
@@ -1343,18 +1363,6 @@ def _blender_cam_to_colmap(cam_obj):
 
 
 # ── Depth / normal material overrides ────────────────────────────────────────
-def _make_euclidean_material():
-    mat = bpy.data.materials.new(name="_Euclidean_Override")
-    mat.use_nodes = True
-    nd, lk = mat.node_tree.nodes, mat.node_tree.links
-    nd.clear()
-    out  = nd.new("ShaderNodeOutputMaterial")
-    emit = nd.new("ShaderNodeEmission")
-    cam  = nd.new("ShaderNodeCameraData")
-    lk.new(cam.outputs["View Distance"], emit.inputs["Strength"])
-    emit.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
-    lk.new(emit.outputs["Emission"], out.inputs["Surface"])
-    return mat
 
 
 def _make_world_normal_material():
@@ -1375,80 +1383,6 @@ def _make_world_normal_material():
     emit.inputs["Strength"].default_value = 1.0
     lk.new(emit.outputs["Emission"], out.inputs["Surface"])
     return mat
-
-
-def _render_override(scene, cam, out_path, override_mat):
-    """Render one camera with a material override; output is 32-bit EXR."""
-    scene.view_layers[0].material_override = override_mat
-    scene.use_nodes = False
-    scene.camera          = cam
-    scene.render.filepath = out_path
-    bpy.ops.render.render(write_still=True)
-
-
-def render_depth(cameras: list, depth_dir: str) -> None:
-    os.makedirs(depth_dir, exist_ok=True)
-    _setup_render(fmt="OPEN_EXR", color_mode="RGB", color_depth="32",
-                  samples=RENDER_SAMPLES_AUX)
-    scene = bpy.context.scene
-    vl    = scene.view_layers[0]
-
-    # ── Z depth via compositor Depth pass (correct in Cycles; emission override
-    #    does NOT reliably produce Z depth in path-tracing mode) ────────────────
-    vl.use_pass_z = True
-    scene.use_nodes = True
-    tree = scene.node_tree
-    for cam, label in cameras:
-        tree.nodes.clear()
-        rl   = tree.nodes.new("CompositorNodeRLayers")
-        comp = tree.nodes.new("CompositorNodeComposite")
-        tree.links.new(rl.outputs["Depth"], comp.inputs["Image"])
-        scene.camera          = cam
-        scene.render.filepath = os.path.join(depth_dir, f"{label}_zdepth")
-        bpy.ops.render.render(write_still=True)
-    vl.use_pass_z   = False
-    scene.use_nodes = False
-
-    # ── Euclidean ray distance via ShaderNodeCameraData "View Distance" ────────
-    euclidean = _make_euclidean_material()
-    for cam, label in cameras:
-        _render_override(scene, cam, os.path.join(depth_dir, f"{label}_euclidean"),
-                         euclidean)
-        print(f"    [DEPTH] {label}")
-    vl.material_override = None
-    bpy.data.materials.remove(euclidean)
-
-
-def render_normals(cameras: list, normals_dir: str) -> None:
-    os.makedirs(normals_dir, exist_ok=True)
-    _setup_render(fmt="OPEN_EXR", color_mode="RGB", color_depth="32",
-                  samples=RENDER_SAMPLES_AUX)
-    scene    = bpy.context.scene
-    vl       = scene.view_layers[0]
-    wnorm_mat = _make_world_normal_material()
-
-    for cam, label in cameras:
-        # World-space normals via material override (remapped to [0,1])
-        _render_override(scene, cam, os.path.join(normals_dir, f"{label}_worldspace"), wnorm_mat)
-
-        # Camera-space normals via compositor Normal pass (raw float, ~[-1,1])
-        vl.material_override = None
-        vl.use_pass_normal   = True
-        scene.use_nodes      = True
-        tree = scene.node_tree
-        tree.nodes.clear()
-        rl   = tree.nodes.new("CompositorNodeRLayers")
-        comp = tree.nodes.new("CompositorNodeComposite")
-        tree.links.new(rl.outputs["Normal"], comp.inputs["Image"])
-        scene.camera          = cam
-        scene.render.filepath = os.path.join(normals_dir, f"{label}_camspace")
-        bpy.ops.render.render(write_still=True)
-        print(f"    [NORM] {label}")
-
-    vl.use_pass_normal   = False
-    vl.material_override = None
-    scene.use_nodes      = False
-    bpy.data.materials.remove(wnorm_mat)
 
 
 def _split_object_masks(combined_exr: str, label: str,
@@ -1487,48 +1421,102 @@ def _split_object_masks(combined_exr: str, label: str,
     bpy.data.images.remove(img)
 
 
-def render_masks(cameras: list, mesh_groups: list, masks_dir: str) -> None:
-    os.makedirs(masks_dir, exist_ok=True)
-    _setup_render(fmt="OPEN_EXR", color_mode="RGB", color_depth="32",
-                  samples=RENDER_SAMPLES_AUX)
-    scene  = bpy.context.scene
-    vl     = scene.view_layers[0]
-    n_obj  = len(mesh_groups)
-    vl.use_pass_object_index = True
-    scene.use_nodes = True
-    tree   = scene.node_tree
-
-    for cam, label in cameras:
-        # Render combined IndexOB (one GPU pass per camera angle)
-        tree.nodes.clear()
-        rl        = tree.nodes.new("CompositorNodeRLayers")
-        comp      = tree.nodes.new("CompositorNodeComposite")
-        mn        = tree.nodes.new("CompositorNodeMath")
-        mn.operation = "ADD"; mn.inputs[1].default_value = 0.0
-        tree.links.new(rl.outputs["IndexOB"], mn.inputs[0])
-        tree.links.new(mn.outputs["Value"],   comp.inputs["Image"])
-        scene.camera          = cam
-        combined_stem         = os.path.join(masks_dir, f"{label}_combined")
-        scene.render.filepath = combined_stem
-        bpy.ops.render.render(write_still=True)
-
-        # Split CPU-side into N binary masks (no extra GPU render needed)
-        _split_object_masks(combined_stem + ".exr", label, masks_dir, n_obj)
-        print(f"    [MASK] {label}  → {n_obj} per-object masks")
-
-    vl.use_pass_object_index = False
-    scene.use_nodes = False
-
-
 # ── Combined-pass renderer (replaces the 4 separate render_* calls) ───────────
+def _camera_intrinsics(cam_obj):
+    """Pinhole intrinsics at render resolution: (fx, fy, cx, cy, fov_h, fov_v)."""
+    aspect = RENDER_RES_X / RENDER_RES_Y
+    fov_h  = cam_obj.data.angle
+    fov_v  = 2 * math.atan(math.tan(fov_h * 0.5) / aspect)
+    fx     = (RENDER_RES_X * 0.5) / math.tan(fov_h * 0.5)
+    fy     = (RENDER_RES_Y * 0.5) / math.tan(fov_v * 0.5)
+    return fx, fy, RENDER_RES_X * 0.5, RENDER_RES_Y * 0.5, fov_h, fov_v
+
+
+def _ray_length_image(cam_obj, name: str) -> "bpy.types.Image":
+    """
+    Float image holding |(u-cx)/fx, (v-cy)/fy, 1| at each pixel centre, so that
+    euclidean ray distance = z-depth * value. Rows are stored bottom-up, as
+    Blender images expect.
+    """
+    import numpy as np
+    fx, fy, cx, cy, _, _ = _camera_intrinsics(cam_obj)
+    u = (np.arange(RENDER_RES_X) + 0.5 - cx) / fx
+    v = (np.arange(RENDER_RES_Y) + 0.5 - cy) / fy           # top row first
+    factor = np.sqrt(1.0 + u[None, :] ** 2 + v[:, None] ** 2)[::-1]
+    rgba = np.ones((RENDER_RES_Y, RENDER_RES_X, 4), dtype=np.float32)
+    rgba[..., :3] = factor[..., None]
+    img = bpy.data.images.new(name, RENDER_RES_X, RENDER_RES_Y,
+                              alpha=False, float_buffer=True)
+    img.colorspace_settings.name = "Non-Color"
+    img.pixels.foreach_set(rgba.ravel())
+    return img
+
+
+def _load_exr_pixels(path: str):
+    """Float EXR -> (H, W, 4) float32 array, rows bottom-up as in Blender images."""
+    import numpy as np
+    img = bpy.data.images.load(path, check_existing=False)
+    img.colorspace_settings.name = "Non-Color"
+    w, h = img.size
+    buf = np.empty(w * h * 4, dtype=np.float32)
+    img.pixels.foreach_get(buf)
+    bpy.data.images.remove(img)
+    return buf.reshape(h, w, 4)
+
+
+def _save_exr_rgb(path: str, rgb) -> None:
+    """Write (H, W, 3) float32 (rows bottom-up) as a 32-bit RGB EXR, values unchanged."""
+    import numpy as np
+    h, w, _ = rgb.shape
+    img = bpy.data.images.new("_exr_out", w, h, alpha=False, float_buffer=True)
+    img.colorspace_settings.name = "Non-Color"
+    rgba = np.ones((h, w, 4), dtype=np.float32)
+    rgba[..., :3] = rgb
+    img.pixels.foreach_set(rgba.ravel())
+    s = bpy.context.scene.render.image_settings
+    saved = (s.file_format, s.color_mode, s.color_depth, s.exr_codec)
+    s.file_format, s.color_mode, s.color_depth, s.exr_codec = "OPEN_EXR", "RGB", "32", "ZIP"
+    img.save_render(path, scene=bpy.context.scene)
+    s.file_format, s.color_mode, s.color_depth, s.exr_codec = saved
+    bpy.data.images.remove(img)
+
+
+def _supersampled_normals(n_hi, index_hi, k: int):
+    """
+    Downsample k x k blocks of single-ray normals (H*k, W*k, 3) to (H, W, 3).
+    Each block takes its majority label (object index, room = 0, background = no
+    hit) and averages the normals of only those sub-pixels, then renormalises, so
+    sub-pixel geometric detail is averaged while object boundaries stay crisp.
+    Background blocks are 0.
+    """
+    import numpy as np
+    H, W = n_hi.shape[0] // k, n_hi.shape[1] // k
+    nb  = n_hi.reshape(H, k, W, k, 3).transpose(0, 2, 1, 3, 4).reshape(H, W, k * k, 3)
+    ib  = index_hi.reshape(H, k, W, k).transpose(0, 2, 1, 3).reshape(H, W, k * k)
+    hit = np.linalg.norm(nb, axis=-1) > 0
+    label  = np.where(hit, np.rint(ib).astype(np.int64) + 1, 0)       # 0 = no hit
+    counts = np.stack([(label == l).sum(-1) for l in range(int(label.max()) + 1)], -1)
+    major  = counts.argmax(-1)
+    sel    = (label == major[..., None]) & (major[..., None] > 0)
+    acc    = (nb * sel[..., None]).sum(2)
+    length = np.linalg.norm(acc, axis=-1, keepdims=True)
+    # Opposite normals can cancel; fall back to the first selected sub-pixel
+    first  = np.take_along_axis(nb, sel.argmax(-1)[..., None, None], axis=2)[:, :, 0]
+    out    = np.where(length > 1e-6, acc / np.maximum(length, 1e-6), first)
+    out[major == 0] = 0
+    return out.astype(np.float32)
+
+
 def render_all_passes(cameras: list, arr_dir: str, mesh_groups: list) -> None:
     """
-    Render all 6 output types per camera in only 3 render calls instead of 6:
+    Render all output types per camera in 2 render calls:
 
-      1. ONE Cycles render  → RGB (denoised) + Z-depth + camera normals + IndexOB
-                              All saved in one shot via compositor OutputFile nodes.
-      2. ONE EEVEE render   → world-space normals  (material override, ~instant)
-      3. ONE EEVEE render   → Euclidean ray distance (material override, ~instant)
+      1. ONE Cycles render  → RGB (denoised) + Z-depth + Euclidean depth (Z-depth x
+                              ray length) + IndexOB, all saved via compositor
+                              OutputFile nodes.
+      2. ONE Cycles render  → world- and camera-space normals, rendered at
+                              NORMAL_SUPERSAMPLE x resolution (1 ray per sub-pixel,
+                              black background) and averaged per object
 
     Replaces render_all + render_depth + render_normals + render_masks.
     """
@@ -1542,13 +1530,11 @@ def render_all_passes(cameras: list, arr_dir: str, mesh_groups: list) -> None:
     scene  = bpy.context.scene
     vl     = scene.view_layers[0]
     n_obj  = len(mesh_groups)
-    eevee  = _eevee_engine()
 
     # ── Pass 1: Main Cycles render — all compositor-based outputs ─────────────
     _setup_render(engine=RENDER_ENGINE, fmt="PNG", color_mode="RGBA",
                   samples=RENDER_SAMPLES)
     vl.use_pass_z             = True
-    vl.use_pass_normal        = True
     vl.use_pass_object_index  = True
     scene.use_nodes           = True
     tree = scene.node_tree
@@ -1578,28 +1564,42 @@ def render_all_passes(cameras: list, arr_dir: str, mesh_groups: list) -> None:
         out.file_slots[1].format.color_depth = "32"
         tree.links.new(rl.outputs["Depth"], out.inputs[1])
 
-        # Slot 2: Camera-space normals → EXR
-        out.file_slots.new(f"normals/{label}_camspace_")
-        out.file_slots[2].use_node_format  = False
-        out.file_slots[2].format.file_format = "OPEN_EXR"
-        out.file_slots[2].format.color_mode  = "RGB"
-        out.file_slots[2].format.color_depth = "32"
-        tree.links.new(rl.outputs["Normal"], out.inputs[2])
-
-        # Slot 3: IndexOB → EXR  (Value → Color implicit conversion via Math node)
+        # Slot 2: IndexOB → EXR  (Value → Color implicit conversion via Math node)
         mn = tree.nodes.new("CompositorNodeMath")
         mn.operation = "ADD"; mn.inputs[1].default_value = 0.0
         tree.links.new(rl.outputs["IndexOB"], mn.inputs[0])
         out.file_slots.new(f"masks/{label}_combined_")
+        out.file_slots[2].use_node_format  = False
+        out.file_slots[2].format.file_format = "OPEN_EXR"
+        out.file_slots[2].format.color_mode  = "RGB"
+        out.file_slots[2].format.color_depth = "32"
+        tree.links.new(mn.outputs["Value"], out.inputs[2])
+
+        # Slot 3: Euclidean ray distance = z-depth * per-pixel ray length.
+        # Derived from the same (un-averaged) Depth pass, so it is pixel-aligned
+        # with zdepth, has no blended edges, and keeps zdepth's no-hit value (>= 1e10).
+        ray_img  = _ray_length_image(cam, f"_raylen_{label}")
+        ray_node = tree.nodes.new("CompositorNodeImage")
+        ray_node.image = ray_img
+        ray_sep  = tree.nodes.new("CompositorNodeSeparateColor")
+        tree.links.new(ray_node.outputs["Image"], ray_sep.inputs["Image"])
+        eucl = tree.nodes.new("CompositorNodeMath")
+        eucl.operation = "MULTIPLY"
+        tree.links.new(rl.outputs["Depth"], eucl.inputs[0])
+        tree.links.new(ray_sep.outputs[0],  eucl.inputs[1])
+        out.file_slots.new(f"depth/{label}_euclidean_")
         out.file_slots[3].use_node_format  = False
         out.file_slots[3].format.file_format = "OPEN_EXR"
         out.file_slots[3].format.color_mode  = "RGB"
         out.file_slots[3].format.color_depth = "32"
-        tree.links.new(mn.outputs["Value"], out.inputs[3])
+        tree.links.new(eucl.outputs["Value"], out.inputs[3])
 
         # Render once — OutputFile node writes all 4 files automatically.
         # write_still=False: we don't need scene.render.filepath output.
+        t0 = time.time()
         bpy.ops.render.render(write_still=False)
+        tree.nodes.remove(ray_node)
+        bpy.data.images.remove(ray_img)
 
         # Blender appends the frame number (0001) to every OutputFile path.
         # Rename to the canonical names expected by downstream writers.
@@ -1607,52 +1607,120 @@ def render_all_passes(cameras: list, arr_dir: str, mesh_groups: list) -> None:
                                 f"rgb/{label}.png")
         _rename_output(arr_dir, f"depth/{label}_zdepth_0001.exr",
                                 f"depth/{label}_zdepth.exr")
-        _rename_output(arr_dir, f"normals/{label}_camspace_0001.exr",
-                                f"normals/{label}_camspace.exr")
         _rename_output(arr_dir, f"masks/{label}_combined_0001.exr",
                                 f"masks/{label}_combined.exr")
+        _rename_output(arr_dir, f"depth/{label}_euclidean_0001.exr",
+                                f"depth/{label}_euclidean.exr")
 
         # Split combined IndexOB mask CPU-side into per-object binary EXRs
         combined_exr = os.path.join(masks_dir, f"{label}_combined.exr")
         _split_object_masks(combined_exr, label, masks_dir, n_obj)
-        print(f"    [PASS1] {label}  RGB + zdepth + cam-normals + masks")
+        print(f"    [PASS1] {label}  RGB + zdepth + euclidean + masks ({time.time() - t0:.1f}s)")
 
     # Clean up main-pass settings
     vl.use_pass_z            = False
-    vl.use_pass_normal       = False
     vl.use_pass_object_index = False
     scene.use_nodes          = False
 
-    aux_eng  = _aux_engine()   # EEVEE on workstation, Cycles on headless server
-    aux_tag  = "EEVEE" if "EEVEE" in aux_eng else "Cycles"
-    aux_samp = 1 if "EEVEE" in aux_eng else RENDER_SAMPLES_AUX
+    # Always Cycles: _aux_engine() picks EEVEE whenever a libEGL is found, but on
+    # headless machines without a working GL driver EEVEE renders garbage.
+    aux_eng  = RENDER_ENGINE
+    aux_tag  = "Cycles"
+    aux_samp = RENDER_SAMPLES_AUX
 
-    # ── Pass 2: World-space normals (material override) ───────────────────────
+    # ── Pass 2: Supersampled geometry render — world- and camera-space normals ─
+    # Detach the world so background pixels are 0 instead of the world colour.
+    # Render at NORMAL_SUPERSAMPLE x resolution with one ray per sub-pixel (near-zero
+    # pixel filter, so a regular k x k grid per output pixel), then average each
+    # block over the sub-pixels of its majority object (_supersampled_normals):
+    # sub-pixel detail (e.g. scanned meshes) is averaged instead of aliased, while
+    # object boundaries stay crisp. Both normal maps come from that same result.
+    import numpy as np
+    k = NORMAL_SUPERSAMPLE
     _setup_render(engine=aux_eng, fmt="OPEN_EXR", color_mode="RGB", color_depth="32",
                   samples=aux_samp)
-    wnorm_mat = _make_world_normal_material()
-    for cam, label in cameras:
-        _render_override(scene, cam,
-                         os.path.join(normals_dir, f"{label}_worldspace"),
-                         wnorm_mat)
-        print(f"    [PASS2] {label}  world-normals ({aux_tag})")
-    vl.material_override = None
-    bpy.data.materials.remove(wnorm_mat)
+    scene.render.resolution_x = RENDER_RES_X * k
+    scene.render.resolution_y = RENDER_RES_Y * k
+    saved_world  = scene.world
+    saved_filter = (scene.cycles.filter_width, scene.render.filter_size)
+    scene.world  = None
+    scene.cycles.filter_width = 0.01
+    scene.render.filter_size  = 0.0
+    wnorm_mat = _make_world_normal_material()        # cheap emission-only shading
+    vl.material_override     = wnorm_mat
+    vl.use_pass_normal       = True
+    vl.use_pass_object_index = True
+    scene.use_nodes          = True
+    tree    = scene.node_tree
+    tmp_dir = os.path.join(arr_dir, "_normals_tmp")
 
-    # ── Pass 3: Euclidean ray distance (material override) ────────────────────
-    eucl_mat = _make_euclidean_material()
-    for cam, label in cameras:
-        _render_override(scene, cam,
-                         os.path.join(depth_dir, f"{label}_euclidean"),
-                         eucl_mat)
-        print(f"    [PASS3] {label}  euclidean-depth ({aux_tag})")
-    vl.material_override = None
-    bpy.data.materials.remove(eucl_mat)
+    import shutil
+    try:
+        for cam, label in cameras:
+            scene.camera = cam
+            tree.nodes.clear()
+            rl  = tree.nodes.new("CompositorNodeRLayers")
+            out = tree.nodes.new("CompositorNodeOutputFile")
+            out.base_path = tmp_dir
+
+            # Slot 0: raw world-space Normal pass (X→R, Y→G, Z→B)
+            out.file_slots[0].path = f"{label}_normal_"
+            sep  = tree.nodes.new("CompositorNodeSeparateColor")
+            comb = tree.nodes.new("CompositorNodeCombineColor")
+            tree.links.new(rl.outputs["Normal"], sep.inputs["Image"])
+            for i in range(3):
+                tree.links.new(sep.outputs[i], comb.inputs[i])
+            tree.links.new(comb.outputs["Image"], out.inputs[0])
+
+            # Slot 1: object index (room = 0), for majority-label averaging
+            idx = tree.nodes.new("CompositorNodeMath")
+            idx.operation = "ADD"; idx.inputs[1].default_value = 0.0
+            tree.links.new(rl.outputs["IndexOB"], idx.inputs[0])
+            out.file_slots.new(f"{label}_index_")
+            tree.links.new(idx.outputs["Value"], out.inputs[1])
+
+            for slot in out.file_slots:
+                slot.use_node_format    = False
+                slot.format.file_format = "OPEN_EXR"
+                slot.format.color_mode  = "RGB"
+                slot.format.color_depth = "32"
+                slot.format.exr_codec   = "NONE"         # temporary files, write fast
+
+            t0 = time.time()
+            bpy.ops.render.render(write_still=False)
+            n_path   = os.path.join(tmp_dir, f"{label}_normal_0001.exr")
+            idx_path = os.path.join(tmp_dir, f"{label}_index_0001.exr")
+            normal = _supersampled_normals(_load_exr_pixels(n_path)[..., :3],
+                                           _load_exr_pixels(idx_path)[..., 0], k)
+            os.remove(n_path); os.remove(idx_path)
+
+            # World space, encoded 0.5 * n + 0.5 (background 0)
+            hit = np.any(normal != 0, axis=-1, keepdims=True)
+            _save_exr_rgb(os.path.join(normals_dir, f"{label}_worldspace.exr"),
+                          np.where(hit, normal * 0.5 + 0.5, 0.0).astype(np.float32))
+            # Camera space: OpenCV / COLMAP frame (x right, y down, z forward), the same
+            # R_w2c written to metadata.json as R_w2c_colmap; background stays 0.
+            R_w2c = np.array(_blender_cam_to_colmap(cam)[0], dtype=np.float32)
+            _save_exr_rgb(os.path.join(normals_dir, f"{label}_camspace.exr"),
+                          (normal @ R_w2c.T).astype(np.float32))
+            print(f"    [PASS2] {label}  world + cam normals ({aux_tag}, {k}x{k} supersampled, {time.time() - t0:.1f}s)")
+    finally:
+        # Remove temporary sub-pixel EXRs and restore render settings even if a render fails
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        vl.use_pass_normal       = False
+        vl.use_pass_object_index = False
+        vl.material_override     = None
+        scene.use_nodes          = False
+        bpy.data.materials.remove(wnorm_mat)
+        scene.world = saved_world
+        scene.cycles.filter_width, scene.render.filter_size = saved_filter
+        scene.render.resolution_x = RENDER_RES_X
+        scene.render.resolution_y = RENDER_RES_Y
 
     # Restore Cycles for subsequent renders
     scene.render.engine = RENDER_ENGINE
-    print(f"    [PASSES] {len(cameras)} cameras × 3 renders "
-          f"(1 Cycles + 2 {aux_tag}) complete")
+    print(f"    [PASSES] {len(cameras)} cameras × 2 renders "
+          f"(1 Cycles + 1 {aux_tag}) complete")
 
 
 def _rename_output(base: str, src_rel: str, dst_rel: str) -> None:
@@ -1667,17 +1735,11 @@ def _rename_output(base: str, src_rel: str, dst_rel: str) -> None:
 # ── COLMAP writer ─────────────────────────────────────────────────────────────
 def write_colmap(cameras: list, colmap_dir: str) -> None:
     os.makedirs(colmap_dir, exist_ok=True)
-    aspect = RENDER_RES_X / RENDER_RES_Y
 
     with open(os.path.join(colmap_dir, "cameras.txt"), "w") as f:
         f.write("# camera_id model width height fx fy cx cy\n")
         for i, (cam, _label) in enumerate(cameras):
-            fov_h = cam.data.angle
-            fov_v = 2 * math.atan(math.tan(fov_h * 0.5) / aspect)
-            fx    = (RENDER_RES_X * 0.5) / math.tan(fov_h * 0.5)
-            fy    = (RENDER_RES_Y * 0.5) / math.tan(fov_v * 0.5)
-            cx    = RENDER_RES_X * 0.5
-            cy    = RENDER_RES_Y * 0.5
+            fx, fy, cx, cy, _, _ = _camera_intrinsics(cam)
             f.write(f"{i+1} PINHOLE {RENDER_RES_X} {RENDER_RES_Y} "
                     f"{fx:.6f} {fy:.6f} {cx:.6f} {cy:.6f}\n")
 
@@ -1698,15 +1760,11 @@ def write_colmap(cameras: list, colmap_dir: str) -> None:
 # ── Metadata writer ───────────────────────────────────────────────────────────
 def write_metadata(cameras: list, mesh_groups: list,
                    placed_circles: list, scene_dir: str) -> None:
-    aspect = RENDER_RES_X / RENDER_RES_Y
     U      = BLENDER_UNIT_TO_M
 
     cam_entries = []
     for i, (cam, label) in enumerate(cameras):
-        fov_h = cam.data.angle
-        fov_v = 2 * math.atan(math.tan(fov_h * 0.5) / aspect)
-        fx    = (RENDER_RES_X * 0.5) / math.tan(fov_h * 0.5)
-        fy    = (RENDER_RES_Y * 0.5) / math.tan(fov_v * 0.5)
+        fx, fy, _, _, fov_h, fov_v = _camera_intrinsics(cam)
         R, t  = _blender_cam_to_colmap(cam)
         pos   = cam.matrix_world.translation
         cam_entries.append({
@@ -1939,40 +1997,143 @@ def write_scene_graph(mesh_groups: list, placed_circles: list,
 
 
 # ── Arrangement helpers ───────────────────────────────────────────────────────
-def rearrange_objects(roots_list: list, mesh_groups: list,
-                      old_circles: list) -> list:
+def snapshot_layout(roots_list: list) -> list:
+    """World matrices of every root, per group (the first arrangement's layout)."""
+    return [[r.matrix_world.copy() for r in roots] for roots in roots_list]
+
+
+def _apply_layout(roots_list: list, layout: list, transforms: list) -> None:
+    """Set each group's roots to transform @ (its matrix in layout)."""
+    for roots, mats, T in zip(roots_list, layout, transforms):
+        for r, M in zip(roots, mats):
+            r.matrix_world = T @ M
+    bpy.context.view_layer.update()
+
+
+def _search_layout(mesh_groups: list):
     """
-    Move every object group to a new random, collision-free position on the
-    floor.  Processes groups in shuffled order so placement bias is avoided.
-    Returns a new placed_circles list in the original group order.
+    Random overlap-free layout for the groups at their current sizes: each group
+    gets a random yaw about the vertical axis and a random position, accepted only
+    if its footprint stays inside the walls (WALL_CLEARANCE) and keeps MIN_GAP from
+    all groups already placed; a group that does not fit restarts the whole layout
+    (REARRANGE_TRIES per group, REARRANGE_ATTEMPTS restarts). Footprints use the same
+    bound_box corners as group_world_bbox, rotated analytically, so the checks match
+    the overlap and wall checks exactly. Returns (per-group transforms relative to
+    the current state, attempts used), or None if no layout was found.
     """
-    new_map = {}                             # idx → (cx, cy, radius)
-    order   = list(range(len(roots_list)))
-    random.shuffle(order)
+    import numpy as np
+    n = len(mesh_groups)
+    pivots, corners = [], []
+    for meshes in mesh_groups:
+        cx, cy = group_center_xy(meshes)
+        pts = np.array([[w[0], w[1]] for obj in meshes for w in _depsgraph_bbox(obj)])
+        pivots.append((cx, cy))
+        corners.append(pts - np.array([cx, cy]))
 
-    for idx in order:
-        roots  = roots_list[idx]
-        meshes = mesh_groups[idx]
+    limit = FLOOR_HALF - WALL_CLEARANCE
+    for attempt in range(REARRANGE_ATTEMPTS):
+        order = list(range(n))
+        random.shuffle(order)
+        boxes, plan = [], {}
+        for idx in order:
+            for _try in range(REARRANGE_TRIES):
+                yaw = random.uniform(0.0, 2 * math.pi)
+                c, s = math.cos(yaw), math.sin(yaw)
+                p = corners[idx] @ np.array([[c, s], [-s, c]])          # rotate by yaw
+                x0, y0 = p.min(axis=0)
+                x1, y1 = p.max(axis=0)
+                if x1 - x0 > 2 * limit or y1 - y0 > 2 * limit:
+                    continue
+                tx = random.uniform(-limit - x0, limit - x1)
+                ty = random.uniform(-limit - y0, limit - y1)
+                box = (tx + x0, tx + x1, ty + y0, ty + y1)
+                if all(box[1] + MIN_GAP <= b[0] or b[1] + MIN_GAP <= box[0] or
+                       box[3] + MIN_GAP <= b[2] or b[3] + MIN_GAP <= box[2] for b in boxes):
+                    boxes.append(box)
+                    plan[idx] = (yaw, tx, ty)
+                    break
+            else:
+                break                                  # this group did not fit: restart
+        if len(plan) == n:
+            transforms = []
+            for idx in range(n):
+                yaw, tx, ty = plan[idx]
+                px, py = pivots[idx]
+                transforms.append(mathutils.Matrix.Translation((tx, ty, 0.0))
+                                  @ mathutils.Matrix.Rotation(yaw, 4, "Z")
+                                  @ mathutils.Matrix.Translation((-px, -py, 0.0)))
+            return transforms, attempt + 1
+    return None
 
-        # Rotate BEFORE computing footprint so radius reflects post-rotation shape
-        random_rotate(roots, meshes)
-        place_on_floor(roots, meshes, floor_z=0.0)
-        radius = group_footprint_radius(meshes)   # post-rotation radius
 
-        placed_so_far = list(new_map.values())
-        spot = find_free_position(radius, placed_so_far)
-        if spot is None:
-            spot = (random.uniform(-FLOOR_HALF * 0.35, FLOOR_HALF * 0.35),
-                    random.uniform(-FLOOR_HALF * 0.35, FLOOR_HALF * 0.35))
+def _layout_is_clean(mesh_groups: list) -> bool:
+    """True if every group is inside the walls (WALL_CLEARANCE) and every pair is MIN_GAP apart."""
+    limit, eps = FLOOR_HALF - WALL_CLEARANCE, 1e-6
+    boxes = [group_world_bbox(m) for m in mesh_groups]
+    for mn, mx in boxes:
+        if mn[0] < -limit - eps or mx[0] > limit + eps or mn[1] < -limit - eps or mx[1] > limit + eps:
+            return False
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            (amn, amx), (bmn, bmx) = boxes[i], boxes[j]
+            if not (amx[0] + MIN_GAP <= bmn[0] + eps or bmx[0] + MIN_GAP <= amn[0] + eps or
+                    amx[1] + MIN_GAP <= bmn[1] + eps or bmx[1] + MIN_GAP <= amn[1] + eps):
+                return False
+    return True
 
-        move_group_xy(roots, meshes, *spot)
-        place_on_floor(roots, meshes, floor_z=0.0)
 
-        cx, cy        = group_center_xy(meshes)
-        actual_radius = group_footprint_radius(meshes)
-        new_map[idx]  = (cx, cy, actual_radius)
+def settle_first_layout(roots_list: list, mesh_groups: list, max_shrinks: int = 60) -> list:
+    """
+    Make the first arrangement overlap-free and inside the walls. A layout that is
+    already clean is kept unchanged. Otherwise search for an overlap-free layout at
+    the current sizes (_search_layout); only if none is found, shrink the group with
+    the largest footprint by 0.85 and search again. Returns synced placed_circles.
+    """
+    n = len(roots_list)
+    for shrinks in range(max_shrinks + 1):
+        if _layout_is_clean(mesh_groups):
+            break
+        found = _search_layout(mesh_groups)
+        if found is not None:
+            transforms, attempts = found
+            _apply_layout(roots_list, snapshot_layout(roots_list), transforms)
+            print(f"    [ARRANGE] first layout made overlap-free after {shrinks} shrink(s), "
+                  f"{attempts} attempt(s)")
+            break
+        areas = []
+        for meshes in mesh_groups:
+            mn, mx = group_world_bbox(meshes)
+            areas.append((mx[0] - mn[0]) * (mx[1] - mn[1]))
+        largest = max(range(n), key=areas.__getitem__)
+        _scale_down_group(roots_list[largest], mesh_groups[largest], 0.85)
+    else:
+        print(f"    [WARN] first layout still not overlap-free after {max_shrinks} shrinks")
+    return [(*group_center_xy(m), group_footprint_radius(m)) for m in mesh_groups]
 
-    return [new_map[i] for i in range(len(roots_list))]
+
+def rearrange_fixed_size(roots_list: list, mesh_groups: list, base_layout: list) -> list:
+    """
+    New arrangement that only moves objects: every group starts from its first-
+    arrangement transform (base_layout, sizes already final) and is placed by
+    _search_layout (random yaw about the vertical axis and position, inside the
+    walls, MIN_GAP apart). Objects are never resized or dropped. If no layout is
+    found, the first arrangement's layout is rotated by a random multiple of 90 deg
+    about the room centre, which always fits (square room). Returns synced
+    placed_circles.
+    """
+    n = len(roots_list)
+    _apply_layout(roots_list, base_layout, [mathutils.Matrix.Identity(4)] * n)
+    found = _search_layout(mesh_groups)
+    if found is not None:
+        transforms, attempts = found
+        _apply_layout(roots_list, base_layout, transforms)
+        print(f"    [ARRANGE] new layout after {attempts} attempt(s)")
+    else:
+        quarter = random.choice([1, 2, 3])
+        _apply_layout(roots_list, base_layout,
+                      [mathutils.Matrix.Rotation(quarter * math.pi / 2, 4, "Z")] * n)
+        print(f"    [ARRANGE] no new layout found; first layout rotated {quarter * 90} deg")
+    return [(*group_center_xy(m), group_footprint_radius(m)) for m in mesh_groups]
 
 
 def _clear_cameras_and_lights() -> None:
@@ -2053,6 +2214,16 @@ def _configure_gpu_for_worker(worker_gpu_id) -> None:
     print("[GPU] No GPU found – CPU fallback")
 
 
+def _scene_seed(scene_idx: int) -> int:
+    """RNG seed for one scene; depends only on SEED and the scene's own index."""
+    return SEED + scene_idx * 997
+
+
+def _scene_indices() -> list:
+    """Scene indices to render in this run: M scenes starting at SCENE_INDEX_OFFSET."""
+    return list(range(SCENE_INDEX_OFFSET, SCENE_INDEX_OFFSET + M))
+
+
 def _render_one_scene(scene_idx: int) -> int:
     """
     Build, render, and write outputs for a single scene.
@@ -2061,6 +2232,9 @@ def _render_one_scene(scene_idx: int) -> int:
     are still written even when one fails.
     """
     import traceback
+    # Re-seed per scene so a scene's content is the same whether it is rendered
+    # by the coordinator, inline, or in a resumed run (SCENE_INDEX_OFFSET).
+    random.seed(_scene_seed(scene_idx))
     scene_label = f"scene_{scene_idx+1:03d}"
     scene_dir   = os.path.join(OUTPUT_DIR, scene_label)
 
@@ -2092,8 +2266,8 @@ def _render_one_scene(scene_idx: int) -> int:
 
         for pick_idx, row in enumerate(picks):
             try:
-                filepath     = row["filepath"]
-                texture_path = row.get("texture_filepath", "").strip()
+                filepath     = row["_abs_filepath"]
+                texture_path = row["_abs_texture"]
 
                 all_new = import_file(filepath)
                 if not all_new:
@@ -2110,8 +2284,7 @@ def _render_one_scene(scene_idx: int) -> int:
 
                 spot = find_free_position(radius, placed_circles)
                 if spot is None:
-                    spot = (random.uniform(-FLOOR_HALF * 0.4, FLOOR_HALF * 0.4),
-                            random.uniform(-FLOOR_HALF * 0.4, FLOOR_HALF * 0.4))
+                    spot = fallback_position(radius, 0.4)
 
                 move_group_xy(roots, meshes, *spot)
                 place_on_floor(roots, meshes, floor_z=0.0)
@@ -2151,6 +2324,10 @@ def _render_one_scene(scene_idx: int) -> int:
 
         assign_object_ids(mesh_groups)
         placed_circles = resolve_overlaps(roots_list, mesh_groups, placed_circles)
+        placed_circles = contain_and_resolve(roots_list, mesh_groups, placed_circles)
+        placed_circles = settle_first_layout(roots_list, mesh_groups)
+        # Sizes are final from here on: later arrangements only move objects
+        base_layout = snapshot_layout(roots_list)
 
         # ── Step 2: arrangements ─────────────────────────────────────────────
         arr_ok = 0
@@ -2162,8 +2339,7 @@ def _render_one_scene(scene_idx: int) -> int:
                 print(f"\n  [{scene_label}] arrangement {arr_idx+1}/{NUM_ARRANGEMENTS}")
 
                 if arr_idx > 0:
-                    placed_circles = rearrange_objects(roots_list, mesh_groups, placed_circles)
-                    placed_circles = resolve_overlaps(roots_list, mesh_groups, placed_circles)
+                    placed_circles = rearrange_fixed_size(roots_list, mesh_groups, base_layout)
 
                 avg_cx    = sum(c[0] for c in placed_circles) / max(len(placed_circles), 1)
                 avg_cy    = sum(c[1] for c in placed_circles) / max(len(placed_circles), 1)
@@ -2215,12 +2391,35 @@ def _render_one_scene(scene_idx: int) -> int:
         return 0
 
 
+def _gpu_slots() -> list:
+    """
+    One slot per GPU the coordinator may use, from --gpus or, by default, the visible
+    GPUs (CUDA_VISIBLE_DEVICES if set, else nvidia-smi). "cpu" hides all GPUs from the
+    workers; None (nothing detected) leaves device selection to Cycles.
+    """
+    import subprocess
+    spec = _args.gpus
+    if spec is not None:
+        if spec.strip().lower() in ("cpu", "none", ""):
+            return ["cpu"]
+        return [g.strip() for g in spec.split(",") if g.strip()]
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible:
+        return [g.strip() for g in visible.split(",") if g.strip()]
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=60)
+        ids = [l.strip() for l in out.stdout.splitlines() if l.strip()] if out.returncode == 0 else []
+    except (OSError, subprocess.TimeoutExpired):
+        ids = []
+    return ids or [None]
+
+
 def _run_coordinator() -> None:
     """
     Spawn one dedicated Blender process per scene.
-    Concurrency is limited to len(GPU_IDS) simultaneous processes via a GPU
-    slot queue — each slot holds one physical GPU ID.  When a scene finishes
-    (success or failure) its slot is released and the next waiting scene starts.
+    Concurrency is one process per GPU slot (_gpu_slots): a scene waits for a free
+    slot, runs pinned to that GPU, and releases it on completion (success or failure).
     Errors in individual scenes are logged but never stop the pipeline.
     """
     import subprocess, threading
@@ -2236,12 +2435,13 @@ def _run_coordinator() -> None:
         )
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    n_slots = len(GPU_IDS) if GPU_IDS else N_WORKERS
+    slots   = _gpu_slots()
+    n_slots = len(slots)
 
-    # Each entry in the queue is one available GPU ID (or None for no pinning).
+    # Each entry in the queue is one slot: a GPU id, "cpu", or None (no pinning).
     # A scene must acquire a slot before launching; it releases on completion.
     gpu_queue: Queue = Queue()
-    for g in (GPU_IDS if GPU_IDS else [None] * N_WORKERS):
+    for g in slots:
         gpu_queue.put(g)
 
     results: dict = {}   # scene_idx → exit_code
@@ -2249,7 +2449,7 @@ def _run_coordinator() -> None:
 
     print(f"\n{'='*60}")
     print(f"[COORD] {M} scenes  |  {n_slots} concurrent slots  "
-          f"|  GPUs={GPU_IDS or 'all'}  |  MAX_OBJ={MAX_OBJECTS_PER_SCENE}")
+          f"|  GPUs={slots}  |  MAX_OBJ={MAX_OBJECTS_PER_SCENE}")
     print(f"{'='*60}")
 
     def _run_scene(scene_idx: int) -> int:
@@ -2257,17 +2457,21 @@ def _run_coordinator() -> None:
         gpu_id = gpu_queue.get()   # blocks until a GPU is free
         tag    = f"S{scene_idx+1:03d}|GPU{gpu_id if gpu_id is not None else 'all'}"
         try:
-            seed_i = SEED + scene_idx * 997
+            seed_i = _scene_seed(scene_idx)
             cmd = [
                 blender, "--background", "--python", script,
                 "--",
+                *_FORWARD_ARGS,
                 "--worker",
                 "--scene-indices", str(scene_idx),
                 "--worker-seed",   str(seed_i),
-                "--worker-gpu-id", str(scene_idx),
+                "--worker-gpu-id", str(gpu_id if gpu_id is not None else -1),
             ]
             env = os.environ.copy()
-            if gpu_id is not None:
+            if gpu_id == "cpu":
+                env["CUDA_VISIBLE_DEVICES"] = ""        # hide all GPUs: Cycles uses the CPU
+                env["HIP_VISIBLE_DEVICES"]  = ""
+            elif gpu_id is not None:
                 env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
                 env["HIP_VISIBLE_DEVICES"]  = str(gpu_id)
 
@@ -2298,9 +2502,9 @@ def _run_coordinator() -> None:
         finally:
             gpu_queue.put(gpu_id)   # always return the slot, even on error
 
-    # Submit all M scenes; the GPU queue caps actual concurrency at n_slots
-    with ThreadPoolExecutor(max_workers=M) as pool:
-        future_map = {pool.submit(_run_scene, i): i for i in range(M)}
+    # Submit all M scenes; one thread per GPU slot (each thread runs one scene at a time)
+    with ThreadPoolExecutor(max_workers=n_slots) as pool:
+        future_map = {pool.submit(_run_scene, i): i for i in _scene_indices()}
         for future in as_completed(future_map):
             idx = future_map[future]
             try:
@@ -2322,7 +2526,6 @@ def _run_coordinator() -> None:
 def _run_worker(scene_indices: list) -> None:
     """Render all scenes in `scene_indices` sequentially inside this process."""
     _configure_gpu_for_worker(WORKER_GPU_ID)
-
     object_counts = []
     for scene_idx in scene_indices:
         object_counts.append(_render_one_scene(scene_idx))
@@ -2342,9 +2545,5 @@ if IS_WORKER:
     # Called by the coordinator — render only the assigned scenes
     _run_worker(WORKER_SCENE_INDICES)
 else:
-    # Top-level invocation — act as coordinator and fan out to N_WORKERS
-    if N_WORKERS <= 1 or M <= 1:
-        # Degenerate case: just run inline without spawning sub-processes
-        _run_worker(list(range(M)))
-    else:
-        _run_coordinator()
+    # Top-level invocation: coordinator, one worker process per scene (honours --gpus)
+    _run_coordinator()

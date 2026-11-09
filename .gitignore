@@ -218,8 +218,9 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Data-generation pipeline artifacts
-data/
-outputs/
+# Data, outputs and caches go in __artifacts/ (or any __* folder); keep *__.py files
+__*
+!*__.py
 logs/
 logs*/
 *.blend

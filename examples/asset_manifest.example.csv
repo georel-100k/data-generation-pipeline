@@ -1,3 +1,0 @@
-filename,object_name,filepath,texture_filepath,gemma_location_type,class
-chair_001,wood chair,/absolute/path/to/chair.glb,,indoor,chair
-lamp_001,table lamp,/absolute/path/to/lamp.obj,/absolute/path/to/lamp_texture.png,both,lamp
